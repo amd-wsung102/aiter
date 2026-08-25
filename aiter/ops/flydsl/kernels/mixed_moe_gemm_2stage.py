@@ -55,6 +55,8 @@ def compile_mixed_moe_gemm1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    work_steal: bool = False,
+    cu_num: int = 304,
 ):
     """Compile an ordinary stage1 MoE kernel."""
     return compile_mixed_moe_gemm1_common(
@@ -84,6 +86,8 @@ def compile_mixed_moe_gemm1(
         xcd_swizzle=xcd_swizzle,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        work_steal=work_steal,
+        cu_num=cu_num,
     )
 
 

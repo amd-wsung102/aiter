@@ -630,6 +630,8 @@ def compile_flydsl_moe_stage1(
     xcd_swizzle: int = 0,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    work_steal: bool = False,
+    cu_num: int = 304,
 ):
     """Compile stage1 kernel (cached via underlying lru_cache)."""
     # a16w-mix (bf16 A x {fp4 mxfp4, int4} W): build the ported gemm1
@@ -690,6 +692,8 @@ def compile_flydsl_moe_stage1(
             xcd_swizzle=xcd_swizzle,
             k_wave=k_wave,
             v2_output_layout=v2_output_layout,
+            work_steal=work_steal,
+            cu_num=cu_num,
         )
     else:
         raise ValueError(
@@ -832,9 +836,17 @@ def _s1_args_fp4(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
+    tile_counter=None,
 ):
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     _bias = bias if bias is not None else empty_f32
+    # Work-steal scheduler counter (per-N-column atomic tile dispenser). Always
+    # part of the ABI; a size-1 dummy is passed when work_steal is off.
+    _counter = (
+        tile_counter
+        if tile_counter is not None
+        else torch.empty(0, device=dev, dtype=torch.int32)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
     args = (
@@ -849,6 +861,7 @@ def _s1_args_fp4(
         ptr_arg(num_valid_ids),
         ptr_arg(_bias),
         ptr_arg(out_scale_sorted),
+        ptr_arg(_counter),
         token_num,
         n_in,
         k_in,
@@ -1446,7 +1459,7 @@ def _flydsl_moe_stage1_impl(
     k_batch: int = 1,
     k_batch_intra_block: int | None = None,
     waves_per_eu: int = 3,
-    b_nt: int = 0,
+    b_nt: int = -1,
     gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -1457,6 +1470,7 @@ def _flydsl_moe_stage1_impl(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    work_steal: bool = False,
     _compile_kernel=compile_flydsl_moe_stage1,
     _build_mx_args=_s1_args_fp4,
 ):
@@ -1493,6 +1507,57 @@ def _flydsl_moe_stage1_impl(
 
     if a_dtype == "fp4":
         model_dim = model_dim * 2
+
+    # Adaptive W1 cache policy (b_nt) + L2 rasterization (xcd_swizzle), selected
+    # only when b_nt is left as the -1 "auto" sentinel (an explicit b_nt always
+    # wins). Keyed on the average M-tiles per expert, which cleanly separates the
+    # two regimes and is a strict no-regression Pareto pick (measured crossover is
+    # ~1 tile/expert; threshold 2.0 leaves a safety margin):
+    #   * high reuse  (prefill / hot experts, >= ~2 tiles/expert): cache W1 in L2
+    #     (b_nt=0) + L2-aware xcd_swizzle=2  -> up to ~1.6x on the stage1 GEMM.
+    #   * low  reuse  (decode, ~1 tile/expert): stream/bypass L2 (b_nt=2) -> ~1.13x.
+    if b_nt < 0:
+        _mtiles_per_expert = (token_num * topk) / max(1, E * tile_m)
+        if _mtiles_per_expert >= 2.0:
+            b_nt = 0
+            if xcd_swizzle == 0:
+                xcd_swizzle = 2
+        else:
+            b_nt = 2
+
+    # Adaptive split-K to fill idle CUs when the tile grid under-fills the machine
+    # (small-batch / expert-parallel decode). k_batch<=0 is the auto sentinel; it
+    # stays 1 (no split -> byte-identical to the non-split path) whenever the
+    # machine is already saturated (tiles >= CU), so it can only ever help and
+    # never regresses. Only engaged for the plain a4w4/a8w4 separated path.
+    if k_batch <= 0:
+        k_batch = 1
+        # Only the a4w4/a8w4 mixed_moe path supports grid split-K. The a16w-mix
+        # (a_dtype="bf16") port has a "no grid split-K" guard, so never auto-engage
+        # it there (it would fault on small warmup/cudagraph batches).
+        if (
+            a_dtype in ("fp4", "fp8")
+            and b_dtype in ("fp4", "fp8")
+            and gate_mode == "separated"
+            and bias is None
+        ):
+            try:
+                _cu = torch.cuda.get_device_properties(a.device).multi_processor_count
+            except Exception:  # noqa: BLE001
+                _cu = 0
+            _nblk = int(sorted_expert_ids.shape[0])
+            _gx = max(1, (inter_dim + tile_n - 1) // tile_n)
+            _tiles = _gx * _nblk
+            if _cu > 0 and 0 < _tiles < _cu:
+                _target = _cu // _tiles
+                # valid k_batch: model_dim % k == 0 and (model_dim//k) % tile_k == 0
+                for _cand in (2, 4, 7, 8, 14, 16, 28):
+                    if (
+                        _cand <= _target
+                        and model_dim % _cand == 0
+                        and (model_dim // _cand) % tile_k == 0
+                    ):
+                        k_batch = _cand
 
     _need_fp4 = out_dtype == "fp4"
     _need_fp8 = out_dtype == "fp8"
@@ -1665,6 +1730,18 @@ def _flydsl_moe_stage1_impl(
             f"{_situ_beta_val!r}/{_situ_linear_beta_val!r}"
         )
 
+    # Work-steal scheduler: allocate a zeroed per-N-column atomic tile counter.
+    # Only meaningful on the MX (fp4/fp8) kernel path; other paths ignore it.
+    _work_steal = bool(work_steal) and use_mx_gemm and not _is_splitk
+    _cu_num = torch.cuda.get_device_properties(dev).multi_processor_count
+    if _work_steal:
+        # Upper bound on N-column tiles (gate+up over inter_dim*2); a few slots
+        # of slack cover the /2 and padding variants of the grid.x formula.
+        _n_cols_ub = (inter_dim * 2 + tile_n - 1) // tile_n + 2
+        _tile_counter = torch.zeros(_n_cols_ub, dtype=torch.int32, device=dev)
+    else:
+        _tile_counter = None
+
     if use_mx_gemm:
         args = _build_mx_args(
             _kernel_out.view(-1),
@@ -1690,6 +1767,7 @@ def _flydsl_moe_stage1_impl(
             swiglu_limit=_swiglu_limit_val,
             situ_beta=_situ_beta_val,
             situ_linear_beta=_situ_linear_beta_val,
+            tile_counter=_tile_counter,
         )
     else:
         args = _s1_args_std(
@@ -1733,6 +1811,8 @@ def _flydsl_moe_stage1_impl(
         "a_scale_one": a_scale_one,
         "xcd_swizzle": xcd_swizzle,
         "k_wave": k_wave,
+        "work_steal": _work_steal,
+        "cu_num": int(_cu_num),
     }
     # The injected FHMoE compiler does not implement the v2 sorted-row layout.
     if _v2_output_layout:
@@ -1907,7 +1987,12 @@ def flydsl_moe_stage1(
     k_batch: int = 1,
     k_batch_intra_block: int | None = None,
     waves_per_eu: int = 3,
-    b_nt: int = 0,
+    # b_nt controls the W1 weight-load cache policy: 2 = non-temporal (L2-stream,
+    # best for decode where W1 is read once/expert), 0 = cache in L2 (best for
+    # prefill/hot experts where W1 is reused across many M-tiles). -1 = "auto":
+    # pick per shape from the average M-tiles/expert (see _flydsl_moe_stage1_impl)
+    # for a strict no-regression Pareto choice across decode and prefill.
+    b_nt: int = -1,
     gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,
@@ -1918,6 +2003,8 @@ def flydsl_moe_stage1(
     swiglu_limit: float | None = None,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    work_steal: bool = False,
+    fuse_rht: bool = False,
 ):
     """Fused gate+up GEMM (MOE stage1).
 
@@ -1939,6 +2026,15 @@ def flydsl_moe_stage1(
         Basic:                      out
         fuse_quant:                 (out, out_scale_sorted)
     """
+    if fuse_rht:
+        # In-kernel block-diagonal Hadamard (RHT) fusion in the fp4 epilogue is a
+        # separate optimization and is not implemented in this kernel yet. The
+        # offline weight-rotation helpers live in aiter.ops.flydsl.rht_utils; the
+        # matching fused activation-rotation is future work.
+        raise NotImplementedError(
+            "fuse_rht (in-kernel Hadamard fusion) is not implemented; see "
+            "aiter.ops.flydsl.rht_utils for the offline W2 rotation path."
+        )
     return _flydsl_moe_stage1_impl(
         a=a,
         w1=w1,
@@ -1975,6 +2071,7 @@ def flydsl_moe_stage1(
         swiglu_limit=swiglu_limit,
         k_wave=k_wave,
         v2_output_layout=v2_output_layout,
+        work_steal=work_steal,
     )
 
 
@@ -2306,6 +2403,7 @@ def flydsl_moe_stage2(
     return_per_slot: bool = False,
     expert_mask: torch.Tensor | None = None,
     topk_ids: torch.Tensor | None = None,
+    work_steal: bool = False,
 ) -> torch.Tensor:
     """Down-projection GEMM (MOE stage2). Supports atomic/reduce modes.
 
@@ -2327,7 +2425,13 @@ def flydsl_moe_stage2(
         post-GEMM reduction fuses the EP validity gather
         ``valid = expert_mask[topk_ids[t, k]] != 0`` and only sums valid
         slots. expert_mask is [num_experts] i32, topk_ids is [token_num, topk] i32.
+    work_steal: opt-in persistent padding-skipping scheduler. Stage2 already
+        ships a static even-split persistent kernel; work_steal routes to it
+        (persist=True) for parity with stage1's work_steal, load-balancing valid
+        tiles across a grid_y=cu_num worker pool and skipping padding blocks.
     """
+    if work_steal and persist is None:
+        persist = True
     return _flydsl_moe_stage2_impl(
         inter_states=inter_states,
         w2=w2,

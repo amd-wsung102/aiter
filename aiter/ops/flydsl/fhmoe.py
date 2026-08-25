@@ -42,6 +42,8 @@ def compile_flydsl_fhmoe_stage1(
     k_wave: int = 1,
     v2_output_layout: bool = False,
     shared_expert_id: int = -1,
+    work_steal: bool = False,  # noqa: ARG001 (FHMoE keeps the static scheduler)
+    cu_num: int = 304,  # noqa: ARG001
 ):
     """Compile the heterogeneous stage1 kernel."""
     from .kernels.fhmoe import compile_mixed_fhmoe_gemm1
@@ -158,6 +160,7 @@ def _s1_args_fhmoe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     pass_swiglu_limit: bool = True,
+    tile_counter=None,
     *,
     shared_w,
     shared_w_scale,
@@ -165,6 +168,11 @@ def _s1_args_fhmoe(
     """Build the expanded heterogeneous stage1 launch ABI."""
     empty_f32 = torch.empty(0, device=dev, dtype=torch.float32)
     kernel_bias = bias if bias is not None else empty_f32
+    _counter = (
+        tile_counter
+        if tile_counter is not None
+        else torch.empty(0, device=dev, dtype=torch.int32)
+    )
     if stream is None:
         stream = torch.cuda.current_stream()
     args = (
@@ -181,6 +189,7 @@ def _s1_args_fhmoe(
         ptr_arg(num_valid_ids),
         ptr_arg(kernel_bias),
         ptr_arg(out_scale_sorted),
+        ptr_arg(_counter),
         token_num,
         n_in,
         k_in,
@@ -273,7 +282,7 @@ def flydsl_fhmoe_stage1(
     use_async_copy: bool = False,
     k_batch: int = 1,
     waves_per_eu: int = 3,
-    b_nt: int = 0,
+    b_nt: int = -1,  # -1 = auto: adaptive cache(prefill)/stream(decode) W1 policy
     gate_mode: str = "separated",
     model_dim_pad: int = 0,
     inter_dim_pad: int = 0,

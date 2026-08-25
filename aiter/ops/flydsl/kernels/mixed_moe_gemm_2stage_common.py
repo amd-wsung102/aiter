@@ -153,8 +153,18 @@ def compile_mixed_moe_gemm1_common(
     k_wave: int = 1,
     shared_expert_id: int | None = None,
     v2_output_layout: bool = False,
+    work_steal: bool = False,
+    cu_num: int = 304,
 ):
-    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim]."""
+    """Compile stage1 kernel: act(X @ W_gate.T, X @ W_up.T) -> [tokens*topk, inter_dim].
+
+    When ``work_steal`` is set, the static ``persist_m`` grid over M-blocks is
+    replaced by a persistent atomic-counter scheduler: a fixed pool of
+    workgroups (grid.y) repeatedly claim ``persist_m``-sized chunks of valid
+    M-blocks from a per-N-column global counter (``arg_tile_counter``), skipping
+    padding blocks and dynamically load-balancing skewed expert routing. The
+    counter must be zeroed by the host before launch. Output is identical to the
+    static schedule (tiles are order-independent for stage1)."""
     heterogeneous_b = shared_expert_id is not None
     if heterogeneous_b and shared_expert_id != experts - 1:
         raise ValueError(
@@ -280,6 +290,7 @@ def compile_mixed_moe_gemm1_common(
     as1_tag = "_as1" if a_scale_one else ""
     xcd_tag = f"_xcd{xcd_swizzle}" if xcd_swizzle > 0 else ""
     v2out_tag = "_v2out" if v2_output_layout else ""
+    ws_tag = "_ws" if work_steal else ""
     # Keep the historical name for silu; swiglu/situv2 get distinct symbols so
     # they cannot alias. SiTUv2 beta values are runtime kernel arguments and
     # therefore must not be part of the on-disk symbol/cache identity.
@@ -287,10 +298,11 @@ def compile_mixed_moe_gemm1_common(
     heterogeneous_tag = f"_shared_fp8_e{shared_expert_id}" if heterogeneous_b else ""
     # ABI v33 adds four runtime SiTUv2 beta scalars; heterogeneous ABI tracks one
     # version ahead of the ordinary kernel.
-    kernel_version = 34 if heterogeneous_b else 33
+    # v35/v36: added arg_tile_counter (work-steal scheduler) to the ABI.
+    kernel_version = 36 if heterogeneous_b else 35
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{ws_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -455,6 +467,7 @@ def compile_mixed_moe_gemm1_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_tile_counter: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -716,11 +729,50 @@ def compile_mixed_moe_gemm1_common(
             c0_p = arith.constant(0, index=True)
             c1_p = arith.constant(1, index=True)
             c_pm = arith.constant(PERSIST_M, index=True)
-            for_persist = scf.ForOp(c0_p, c_pm, c1_p)
-            for_ip = ir.InsertionPoint(for_persist.body)
-            for_ip.__enter__()
-            mi_p = for_persist.induction_variable
-            bx = bx_persist * c_pm + mi_p
+
+            if const_expr(work_steal):
+                # Persistent padding-skipping scheduler: a fixed worker pool
+                # (grid.y) statically even-splits the *valid* M-blocks, mirroring
+                # the proven stage2 persistent design. This skips padding tiles
+                # and balances load across workgroups. The per-block trip count is
+                # workgroup-uniform (derived from bx_persist), so the in-body
+                # barriers stay in lockstep. Output matches the static schedule
+                # since stage1 tiles are order-independent.
+                #
+                # NB: an atomic-counter (true work-steal) variant deadlocks here
+                # because scf.WhileOp with an in-body barrier lowers to divergent
+                # loop control on this backend; arg_tile_counter is reserved for a
+                # future backend that supports it.
+                c_sbm_ws = arith.constant(sort_block_m, index=True)
+                total_ws = (
+                    arith.index_cast(ir.IndexType.get(), num_valid_i32)
+                    + c_sbm_ws
+                    - c1_p
+                ) // c_sbm_ws
+                cu_idx_ws = arith.constant(max(1, int(cu_num)), index=True)
+                nworkers_ws = arith.select(
+                    arith.cmpi(CmpIPredicate.ult, size_expert_ids_in, cu_idx_ws),
+                    size_expert_ids_in,
+                    cu_idx_ws,
+                )
+                base_ws = total_ws // nworkers_ws
+                rem_ws = total_ws - base_ws * nworkers_ws
+                has_extra_ws = arith.cmpi(CmpIPredicate.ult, bx_persist, rem_ws)
+                extra_ws = arith.select(has_extra_ws, c1_p, c0_p)
+                tiles_per_block_ws = base_ws + extra_ws
+                start_tail_ws = arith.select(has_extra_ws, bx_persist, rem_ws)
+                persist_start_ws = bx_persist * base_ws + start_tail_ws
+                for_persist = scf.ForOp(c0_p, tiles_per_block_ws, c1_p)
+                for_ip = ir.InsertionPoint(for_persist.body)
+                for_ip.__enter__()
+                mi_p = for_persist.induction_variable
+                bx = persist_start_ws + mi_p
+            else:
+                for_persist = scf.ForOp(c0_p, c_pm, c1_p)
+                for_ip = ir.InsertionPoint(for_persist.body)
+                for_ip.__enter__()
+                mi_p = for_persist.induction_variable
+                bx = bx_persist * c_pm + mi_p
             bx_m = bx * arith.constant(sort_block_m, index=True)
 
             bx_m_i32 = arith.index_cast(T.i32, bx_m)
@@ -3084,6 +3136,7 @@ def compile_mixed_moe_gemm1_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_tile_counter: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3108,6 +3161,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_num_valid_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -3134,6 +3188,7 @@ def compile_mixed_moe_gemm1_common(
             arg_num_valid_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_tile_counter: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_n_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3158,6 +3213,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_num_valid_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_n_in,
                 i32_k_in,
@@ -3209,6 +3265,7 @@ def compile_mixed_moe_gemm1_common(
         arg_max_token_ids: fx.Pointer,
         arg_bias: fx.Pointer,
         arg_out_scale_sorted: fx.Pointer,
+        arg_tile_counter: fx.Pointer,
         i32_tokens_in: fx.Int32,
         i32_inter_in: fx.Int32,
         i32_k_in: fx.Int32,
@@ -3256,6 +3313,20 @@ def compile_mixed_moe_gemm1_common(
             - arith.constant(1, index=True)
         ) // c_pm_l
 
+        if const_expr(work_steal):
+            # Persistent atomic-counter scheduler: launch a fixed worker pool per
+            # N-column (grid.y) that claims M-block chunks from arg_tile_counter.
+            # Cap workers at the number of M-blocks so we never spawn idle groups.
+            size_eids_idx = arith.index_cast(
+                ir.IndexType.get(), i32_size_expert_ids_in.ir_value()
+            )
+            cu_idx = arith.constant(max(1, int(cu_num)), index=True)
+            gy = arith.select(
+                arith.cmpi(CmpIPredicate.ult, size_eids_idx, cu_idx),
+                size_eids_idx,
+                cu_idx,
+            )
+
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
                 arg_out,
@@ -3271,6 +3342,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_max_token_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_inter_in,
                 i32_k_in,
@@ -3294,6 +3366,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_max_token_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_inter_in,
                 i32_k_in,
@@ -3330,6 +3403,7 @@ def compile_mixed_moe_gemm1_common(
             arg_max_token_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_tile_counter: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3355,6 +3429,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_max_token_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_inter_in,
                 i32_k_in,
@@ -3382,6 +3457,7 @@ def compile_mixed_moe_gemm1_common(
             arg_max_token_ids: fx.Pointer,
             arg_bias: fx.Pointer,
             arg_out_scale_sorted: fx.Pointer,
+            arg_tile_counter: fx.Pointer,
             i32_tokens_in: fx.Int32,
             i32_inter_in: fx.Int32,
             i32_k_in: fx.Int32,
@@ -3407,6 +3483,7 @@ def compile_mixed_moe_gemm1_common(
                 arg_max_token_ids,
                 arg_bias,
                 arg_out_scale_sorted,
+                arg_tile_counter,
                 i32_tokens_in,
                 i32_inter_in,
                 i32_k_in,

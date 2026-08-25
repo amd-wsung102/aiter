@@ -1454,9 +1454,13 @@ def _flydsl_stage1_wrapper(
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
         use_async_copy=True,
-        k_batch=parsed.get("k_batch", 1),
+        # 0 = auto: enable split-K only when the tile grid under-fills the CUs
+        # (small-batch / EP decode); no-op (byte-identical) once saturated.
+        k_batch=parsed.get("k_batch", 0),
         waves_per_eu=parsed.get("waves_per_eu", 3),
-        b_nt=parsed.get("b_nt", 2),
+        # -1 = auto: adaptively cache (prefill) vs stream (decode) W1 per shape.
+        # A tuned CSV b_nt still wins; only untuned shapes get the auto pick.
+        b_nt=parsed.get("b_nt", -1),
         gate_mode=parsed.get("gate_mode", "separated"),
         inter_dim_pad=inter_dim_pad,
         model_dim_pad=model_dim_pad,
